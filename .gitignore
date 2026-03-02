@@ -1,0 +1,16 @@
+wandb
+__pycache__
+datasets
+sample_images
+.env
+logs
+scripts.tar.gz
+notes.txt
+material_classification_poc.ipynb
+Fine_tuning_MaskFormerForInstanceSegmentation_on_semantic_sidewalk.ipynb
+configs
+configs_v2
+plots
+predictions
+dataset/analyze_preparation_outcomes.ipynb
+libs
