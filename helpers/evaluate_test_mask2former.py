@@ -453,10 +453,31 @@ def main(args):
     if is_main_process():
         print("Loading dataset...")
     
-    dataset = load_dataset("AllanK24/apple-dms-materials", split="test")
-    
+    # Load dataset
     if is_main_process():
-        print(f"Test set size: {len(dataset)} samples")
+        print("Loading dataset...")
+    
+    raw_dataset = load_dataset("AllanK24/apple-dms-materials", split="test")
+
+    # Define a rapid mapping function to tokenize features on your CPU workers
+    def preprocess_function(examples):
+        images = [img.convert("RGB") if img.mode != "RGB" else img for img in examples["image"]]
+        # This handles the normalization and resizing ahead of time
+        model_inputs = processor(images=images, return_tensors="np")
+        # Add labels manually so the collator can find them
+        model_inputs["labels"] = [np.array(lbl) for lbl in examples["label"]]
+        return model_inputs
+
+    if is_main_process():
+        print("Mapping processor across the test set (Pre-Tokenization)...")
+    
+    # Use .map with multiple writers to cache the tensors
+    dataset = raw_dataset.map(
+        preprocess_function, 
+        batched=True, 
+        batch_size=args.batch_size,
+        num_proc=4 # Spreads the workload across 4 CPU cores instantly
+    )
     
     # Create distributed sampler
     sampler = DistributedSampler(
@@ -529,39 +550,27 @@ def main(args):
             # Calculate global indices for this batch
             batch_start_idx = batch_idx * batch_size * world_size + rank * batch_size
             
-            # Prepare batch data
-            images = []
-            labels = []
-            original_sizes = []
+            # The batch already contains tokenized arrays! Push them straight to VRAM
+            pixel_values = torch.stack([torch.tensor(sample["pixel_values"]) for sample in batch]).to(device)
+            pixel_mask = torch.stack([torch.tensor(sample["pixel_mask"]) for sample in batch]).to(device)
             
-            for i, sample in enumerate(batch):
-                image = sample["image"]
-                if image.mode != "RGB":
-                    image = image.convert("RGB")
-                images.append(image)
-                
-                label = np.array(sample["label"])
-                labels.append(label)
-                original_sizes.append(label.shape[:2])
+            labels = [np.array(sample["labels"]) for sample in batch]
+            original_sizes = [lbl.shape[:2] for lbl in labels]
             
-            # Batch preprocess
-            inputs = processor(images=images, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
+            # Pack inputs directly for the RTX 5090
+            inputs = {"pixel_values": pixel_values, "pixel_mask": pixel_mask}
             
-            # Batch forward pass
+            # Batch forward pass (Runs at full speed on Blackwell Tensor Cores!)
             outputs = model(**inputs)
             
-            # Post-process each sample
+            # Post-process predictions
             pred_segs = processor.post_process_semantic_segmentation(
                 outputs,
                 target_sizes=original_sizes
             )
             
-            # Process each sample in batch
-            for i, (pred_seg, label, image) in enumerate(zip(pred_segs, labels, images)):
-                pred_seg_np = pred_seg.cpu().numpy()
-                
-                # Update confusion matrix
+            # Process each sample in batch for metric updates
+            for i, (pred_seg, label) in enumerate(zip(pred_segs, labels)):
                 pred_tensor = pred_seg.to(device)
                 label_tensor = torch.from_numpy(label).to(device)
                 
@@ -574,17 +583,17 @@ def main(args):
                 confusion_matrix += batch_conf
                 
                 # Compute boundary IoU for this sample
-                boundary_metrics = compute_boundary_iou(
-                    pred_seg_np,
-                    label,
-                    num_classes,
-                    ignore_index=0,
-                    dilation_radius=2,
-                )
+                # boundary_metrics = compute_boundary_iou(
+                #     pred_seg_np,
+                #     label,
+                #     num_classes,
+                #     ignore_index=0,
+                #     dilation_radius=2,
+                # )
                 
-                for class_id, biou in boundary_metrics["boundary_iou_per_class"].items():
-                    boundary_iou_sum[class_id] += biou
-                    boundary_iou_count[class_id] += 1
+                # for class_id, biou in boundary_metrics["boundary_iou_per_class"].items():
+                #     boundary_iou_sum[class_id] += biou
+                #     boundary_iou_count[class_id] += 1
                 
                 # Save sample if selected
                 global_idx = batch_start_idx + i
