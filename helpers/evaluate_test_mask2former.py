@@ -467,16 +467,16 @@ def main(args):
         # Add labels manually so the collator can find them
         model_inputs["labels"] = [np.array(lbl) for lbl in examples["label"]]
         return model_inputs
-
-    if is_main_process():
-        print("Mapping processor across the test set (Pre-Tokenization)...")
     
+    available_cpus = max(1, int(os.cpu_count() * 0.75)) 
+    print(f"Sprinting pre-tokenization across {available_cpus} CPU threads...")
+
     # Use .map with multiple writers to cache the tensors
     dataset = raw_dataset.map(
         preprocess_function, 
         batched=True, 
         batch_size=args.batch_size,
-        num_proc=4 # Spreads the workload across 4 CPU cores instantly
+        num_proc=available_cpus # Automatically scales to ~90 cores on your system!
     )
     
     # Create distributed sampler
